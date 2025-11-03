@@ -1,32 +1,31 @@
 -- *** 数栖平台-数据服务认证插件 (dt-hmac-auth) ***
 -- 请求头说明：
---    X-AURORA-APPKEY       : AK (APPKEY_HEADER)
---    X-AURORA-SIGN         : 签名字符串 (SIGN_HEADER)
---    X-AURORA-TIMESTAMP    : 时间戳 (TIMESTAMP_HEADER)
---    CONTENT-MD5           : RequestBody MD5
+--    X-AURORA-APPKEY       : AK, APPKEY_HEADER
+--    X-AURORA-SIGN         : 签名字符串, SIGN_HEADER
+--    X-AURORA-TIMESTAMP    : 时间戳, TIMESTAMP_HEADER
+--    CONTENT-MD5           : 请求体MD5
+-- 请求体验证说明：
+-- Md5Crypt.md5Crypt 算法，是一种带盐（Salt）的密码哈希算法，非标准MD5实现
+-- 本插件仅做认证兼容，不验证请求体MD5
 -- *** ------------------------------------ ***
 local ngx = ngx
 local abs = math.abs
-local ngx_time = ngx.time
 local ipairs = ipairs
 local core = require("apisix.core")
 local hmac = require("resty.hmac")
 local consumer = require("apisix.consumer")
-local ngx_decode_base64 = ngx.decode_base64
 local ngx_encode_base64 = ngx.encode_base64
 local plugin_name = "dt-hmac-auth"
--- 引入 resty.md5 和 resty.string 用于 Hex 编码
 local resty_md5 = require("resty.md5")
 local resty_string = require("resty.string")
-local ngx_re = require("ngx.re")
 local schema_def = require("apisix.schema_def")
 local auth_utils = require("apisix.utils.auth")
 
 -- HTTP Header 常量
-local APPKEY_HEADER = "X-AURORA-APPKEY"
-local SIGN_HEADER = "X-AURORA-SIGN"
-local TIMESTAMP_HEADER = "X-AURORA-TIMESTAMP"
-local CONTENT_MD5_HEADER = "CONTENT-MD5"
+local APPKEY_HEADER         = "X-AURORA-APPKEY"
+local SIGN_HEADER           = "X-AURORA-SIGN"
+local TIMESTAMP_HEADER      = "X-AURORA-TIMESTAMP"
+local CONTENT_MD5_HEADER    = "CONTENT-MD5"
 
 local schema = {
     type = "object",
@@ -36,11 +35,6 @@ local schema = {
             type = "integer",
             default = 300,
             minimum = 1
-        },
-        validate_request_body = {
-            type = "boolean",
-            title = "A boolean value telling the plugin to enable body validation",
-            default = false,
         },
         hide_credentials = { type = "boolean", default = false },
         anonymous_consumer = schema_def.anonymous_consumer_schema,
@@ -93,7 +87,7 @@ end
 
 
 ---
--- queryString参数排序
+-- queryString参数排序，并且数组参数只提取第一个值
 --
 local function build_query_string()
     local raw_query = ngx.var.query_string
@@ -227,22 +221,7 @@ local function validate(ctx, conf, params)
         end
     end
 
-    -- 4.验证Body（Content-MD5）
-    if conf.validate_request_body then
-        local req_body, err = core.request.get_body()
-        if err then
-            return nil, err
-        end
-
-        req_body = req_body or ""
-        local digest_created = calculate_content_md5(req_body)
-
-        if digest_created ~= params.content_md5 then
-            return nil, "Invalid " .. CONTENT_MD5_HEADER .. " (Body digest mismatch)"
-        end
-    end
-
-    -- 5.生成并验证签名
+    -- 4.生成并验证签名
     local generated_signature, gen_err = generate_signature(secret_key, params)
     if gen_err then
         return nil, gen_err
