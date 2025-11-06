@@ -1,7 +1,6 @@
 --
 -- 请求响应结果JSON包装插件（response-json-wrap）
 --
-
 local core      = require("apisix.core")
 local ngx       = ngx
 local cjson     = require("cjson.safe")
@@ -105,6 +104,9 @@ function _M.header_filter(conf, ctx)
     if matched then
         ctx.wrap_enabled = true
         ctx.wrap_format = fmt
+        ngx.header["content-length"] = nil
+        -- 设置响应头
+        ngx.header["content-type"] = "application/json; charset=utf-8"
     else
         ctx.wrap_enabled = false
     end
@@ -138,13 +140,26 @@ function _M.body_filter(conf, ctx)
     end
 
     local wrapped = wrap_response(conf, status, content, is_json)
-    local new_body = cjson.encode(wrapped)
+    local ok, new_body = pcall(cjson.encode, wrapped)
+    if not ok then
+        core.log.err(plugin_name, ": Failed to encode final response (upstream response may contain invalid UTF-8 bytes): ", new_body)
 
-    ngx.header["content-type"] = "application/json; charset=utf-8"
-    ngx.header["content-length"] = #new_body
+        -- 502 Bad Gateway
+        local safe_status = 502
+        ngx.status = safe_status
+
+        local safe_wrapped = {
+            code = safe_status,
+            success = false,
+            message = "Bad Gateway: Upstream response contained invalid characters",
+            content = nil -- 保证 content 为 nil
+        }
+        new_body = cjson.encode(safe_wrapped)
+    end
+
+    ngx.header["content-length"] = nil
     ngx.arg[1] = new_body
+    ngx.arg[2] = true -- 标记这是最后一块数据
 end
 
 return _M
-
-
