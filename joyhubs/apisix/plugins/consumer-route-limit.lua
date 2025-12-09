@@ -14,37 +14,37 @@ local schema = {
         -- 1. Redis Policy Selection
         policy = {
             type = "string",
-            enum = {"redis", "redis-cluster"},
+            enum = { "redis", "redis-cluster" },
             default = "redis"
         },
 
         -- 2. Standalone Configuration (policy = "redis")
-        redis_host = {type = "string", minLength = 1},
-        redis_port = {type = "integer", minimum = 1, default = 6379},
-        redis_database = {type = "integer", minimum = 0, default = 0},
-        redis_ssl = {type = "boolean", default = false},
-        redis_ssl_verify = {type = "boolean", default = false},
+        redis_host = { type = "string", minLength = 1 },
+        redis_port = { type = "integer", minimum = 1, default = 6379 },
+        redis_database = { type = "integer", minimum = 0, default = 0 },
+        redis_ssl = { type = "boolean", default = false },
+        redis_ssl_verify = { type = "boolean", default = false },
 
         -- 3. Cluster Configuration (policy = "redis-cluster")
         redis_cluster_nodes = {
             type = "array",
-            minItems = 1,
+            minItems = 2,
             items = {
                 type = "string", minLength = 2, maxLength = 100
             }
         },
-        redis_cluster_ssl = {type = "boolean", default = false},
-        redis_cluster_ssl_verify = {type = "boolean", default = false},
+        redis_cluster_ssl = { type = "boolean", default = false },
+        redis_cluster_ssl_verify = { type = "boolean", default = false },
 
         -- Redis Auth & Timeout
         -- Redis Username (用于 Redis ACL)
-        redis_username = {type = "string", minLength = 1},
-        redis_password = {type = "string", minLength = 0},
-        redis_timeout = {type = "integer", minimum = 1, default = 1000},
+        redis_username = { type = "string", minLength = 1 },
+        redis_password = { type = "string", minLength = 0 },
+        redis_timeout = { type = "integer", minimum = 1, default = 1000 },
 
         -- 4. Global Default Configuration
-        time_window = {type = "integer", minimum = 1, default = 60},
-        default_count = {type = "integer", default = 0 },
+        time_window = { type = "integer", minimum = 1, default = 60 },
+        default_count = { type = "integer", default = 0 },
 
         -- 5. Dynamic Quota Map
         consumer_quotas = {
@@ -53,28 +53,28 @@ local schema = {
                 ["^.+$"] = {
                     type = "object",
                     properties = {
-                        count = {type = "integer", minimum = 1},
-                        time_window = {type = "integer", minimum = 1}
+                        count = { type = "integer", minimum = 1 },
+                        time_window = { type = "integer", minimum = 1 }
                     },
-                    required = {"count"}
+                    required = { "count" }
                 }
             }
         },
 
         -- 6. Key Configuration
-        key_prefix = {type = "string", default = "dvc:crl:"},
+        key_prefix = { type = "string", default = "dvc:crl:" },
 
         -- 7. Reliability
-        allow_degradation = {type = "boolean", default = true},
+        allow_degradation = { type = "boolean", default = true },
 
         -- 8. Response Info
-        show_limit_quota_header = {type = "boolean", default = true},
+        show_limit_quota_header = { type = "boolean", default = true },
         -- 429 Too many requests
-        rejected_code = {type = "integer", minimum = 200, maximum = 599, default = 429},
-        rejected_msg = {type = "string", minLength = 1}
+        rejected_code = { type = "integer", minimum = 200, maximum = 599, default = 429 },
+        rejected_msg = { type = "string", minLength = 1 }
     },
 
-    required = {"redis_password"},
+    required = { "redis_password" },
     dependencies = {
         policy = {
             oneOf = {
@@ -83,14 +83,14 @@ local schema = {
                         policy = { const = "redis-cluster" },
                         redis_cluster_nodes = { minItems = 2 }
                     },
-                    required = {"redis_cluster_nodes"}
+                    required = { "redis_cluster_nodes" }
                 },
                 {
                     properties = {
                         policy = { const = "redis" },
                         redis_host = { minLength = 1 }
                     },
-                    required = {"redis_host"}
+                    required = { "redis_host" }
                 }
             }
         }
@@ -198,16 +198,20 @@ function _M.access(conf, ctx)
     -- Core Logic: Get Client
     local red, err = get_redis_client(conf)
     if not red then
-        if conf.allow_degradation then return end
-        return 500, {error_msg = "Internal Rate Limit Error"}
+        if conf.allow_degradation then
+            return
+        end
+        return 500, { error_msg = "Internal Rate Limit Error" }
     end
 
     -- Execute Script with Dynamic Window
     local res, err = red:eval(script, 1, limit_key, limit_count, limit_window, 1)
 
     if err then
-        if conf.allow_degradation then return end
-        return 500, {error_msg = "Internal Rate Limit Error"}
+        if conf.allow_degradation then
+            return
+        end
+        return 500, { error_msg = "Internal Rate Limit Error" }
     end
 
     local remaining = res[1]
