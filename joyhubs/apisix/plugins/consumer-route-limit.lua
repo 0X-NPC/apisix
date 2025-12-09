@@ -4,27 +4,49 @@
 --
 local core = require("apisix.core")
 local redis = require("apisix.utils.redis")
+local redis_cluster = require("apisix.utils.rediscluster")
 local plugin_name = "consumer-route-limit"
 
 -- Default Schema
 local schema = {
     type = "object",
     properties = {
-        -- 1. Redis Configuration
+        -- 1. Redis Policy Selection
+        policy = {
+            type = "string",
+            enum = {"redis", "redis-cluster"},
+            default = "redis"
+        },
+
+        -- 2. Standalone Configuration (policy = "redis")
         redis_host = {type = "string", minLength = 1},
         redis_port = {type = "integer", minimum = 1, default = 6379},
-        redis_password = {type = "string", minLength = 0},
         redis_database = {type = "integer", minimum = 0, default = 0},
+        redis_ssl = {type = "boolean", default = false},
+        redis_ssl_verify = {type = "boolean", default = false},
+
+        -- 3. Cluster Configuration (policy = "redis-cluster")
+        redis_cluster_nodes = {
+            type = "array",
+            minItems = 1,
+            items = {
+                type = "string", minLength = 2, maxLength = 100
+            }
+        },
+        redis_cluster_ssl = {type = "boolean", default = false},
+        redis_cluster_ssl_verify = {type = "boolean", default = false},
+
+        -- Redis Auth & Timeout
+        -- Redis Username (用于 Redis ACL)
+        redis_username = {type = "string", minLength = 1},
+        redis_password = {type = "string", minLength = 0},
         redis_timeout = {type = "integer", minimum = 1, default = 1000},
 
-        -- 2. Global Default Configuration
-        -- 默认时间窗口，单位：秒（当特定租户未配置窗口时使用）
+        -- 4. Global Default Configuration
         time_window = {type = "integer", minimum = 1, default = 60},
-        -- 默认限制次数，允许配置 0 或 -1 表示不限制。
         default_count = {type = "integer", default = 0 },
 
-        -- 3. Dynamic Quota Map
-        -- consumer_name -> { count, time_window(optional) }
+        -- 5. Dynamic Quota Map
         consumer_quotas = {
             type = "object",
             patternProperties = {
@@ -34,24 +56,45 @@ local schema = {
                         count = {type = "integer", minimum = 1},
                         time_window = {type = "integer", minimum = 1}
                     },
-                    required = {"count"} -- 必须配置次数，窗口可选（默认继承全局）
+                    required = {"count"}
                 }
             }
         },
 
-        -- 4. Key Configuration
+        -- 6. Key Configuration
         key_prefix = {type = "string", default = "dvc:crl:"},
 
-        -- 5. Reliability
+        -- 7. Reliability
         allow_degradation = {type = "boolean", default = true},
 
-        -- 6. Response Info, 429 (Too many requests)
+        -- 8. Response Info
         show_limit_quota_header = {type = "boolean", default = true},
+        -- 429 Too many requests
         rejected_code = {type = "integer", minimum = 200, maximum = 599, default = 429},
         rejected_msg = {type = "string", minLength = 1}
     },
-    -- HOTS、PASSWORD为必填项
-    required = {"redis_host", "redis_password"}
+
+    required = {"redis_password"},
+    dependencies = {
+        policy = {
+            oneOf = {
+                {
+                    properties = {
+                        policy = { const = "redis-cluster" },
+                        redis_cluster_nodes = { minItems = 2 }
+                    },
+                    required = {"redis_cluster_nodes"}
+                },
+                {
+                    properties = {
+                        policy = { const = "redis" },
+                        redis_host = { minLength = 1 }
+                    },
+                    required = {"redis_host"}
+                }
+            }
+        }
+    }
 }
 
 local _M = {
@@ -117,6 +160,30 @@ local function get_limit_config(conf, consumer_name)
     return nil, nil
 end
 
+-- 获取 Redis 客户端（支持单机和集群，含 SSL 处理）
+local function get_redis_client(conf)
+    if conf.policy == "redis-cluster" then
+        -- 集群模式
+        -- 1. 映射密码
+        if conf.redis_password and conf.redis_password ~= "" then
+            conf.auth = conf.redis_password
+        end
+        -- 2. 映射 SSL 配置，确保底层驱动能识别
+        if conf.redis_cluster_ssl then
+            conf.ssl = true
+        end
+        if conf.redis_cluster_ssl_verify then
+            conf.ssl_verify = true
+        end
+        -- 注意：复用了官方limit-count插件定义的dict_name
+        return redis_cluster.new(conf, "plugin-limit-count-redis-cluster-slot-lock")
+    else
+        -- 单机模式
+        -- apisix.utils.redis 内部会自动处理 redis_ssl, redis_ssl_verify 以及 redis_username
+        return redis.new(conf)
+    end
+end
+
 function _M.access(conf, ctx)
     local limit_key, consumer_name = gen_key(conf, ctx)
 
@@ -128,10 +195,9 @@ function _M.access(conf, ctx)
         return
     end
 
-    -- Core Logic
-    local red, err = redis.new(conf)
+    -- Core Logic: Get Client
+    local red, err = get_redis_client(conf)
     if not red then
-        core.log.error("failed to connect redis: ", err)
         if conf.allow_degradation then return end
         return 500, {error_msg = "Internal Rate Limit Error"}
     end
@@ -140,8 +206,6 @@ function _M.access(conf, ctx)
     local res, err = red:eval(script, 1, limit_key, limit_count, limit_window, 1)
 
     if err then
-        core.log.error("failed to execute redis script: ", err)
-        red:set_keepalive(10000, 100)
         if conf.allow_degradation then return end
         return 500, {error_msg = "Internal Rate Limit Error"}
     end
@@ -149,9 +213,9 @@ function _M.access(conf, ctx)
     local remaining = res[1]
     local ttl = res[2]
 
-    local ok, err = red:set_keepalive(10000, 100)
-    if not ok then
-        core.log.warn("failed to set keepalive: ", err)
+    -- 单机/主从Redis需要通过set_keepalive主动释放连接
+    if red.set_keepalive then
+        red:set_keepalive(10000, 100)
     end
 
     if conf.show_limit_quota_header then
