@@ -75,25 +75,16 @@ local schema = {
     },
 
     required = { "redis_password" },
-    dependencies = {
-        policy = {
-            oneOf = {
-                {
-                    properties = {
-                        policy = { const = "redis-cluster" },
-                        redis_cluster_nodes = { minItems = 2 }
-                    },
-                    required = { "redis_cluster_nodes" }
-                },
-                {
-                    properties = {
-                        policy = { const = "redis" },
-                        redis_host = { minLength = 1 }
-                    },
-                    required = { "redis_host" }
-                }
-            }
-        }
+    ["if"] = {
+        properties = { policy = { const = "redis-cluster" } },
+        -- 默认值也能触发校验
+        required = { "policy" }
+    },
+    ["then"] = {
+        required = { "redis_cluster_nodes" }
+    },
+    ["else"] = {
+        required = { "redis_host" }
     }
 }
 
