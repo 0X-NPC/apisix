@@ -1,9 +1,9 @@
 --
 -- 请求响应结果JSON包装插件（response-json-wrap）
 --
-local core = require("apisix.core")
-local ngx = ngx
-local cjson = require("cjson.safe")
+local core      = require("apisix.core")
+local ngx       = ngx
+local cjson     = require("cjson.safe")
 
 local plugin_name = "response-json-wrap"
 
@@ -30,16 +30,27 @@ local schema = {
                 ["404"] = "Not Found",
                 ["500"] = "Internal Server Error"
             }
+        },
+        response_codes = {
+            type = "object",
+            properties = {
+                success = { type = "integer" },
+                failed = { type = "integer" }
+            },
+            default = {
+                success = 0,
+                failed = 1
+            }
         }
     }
 }
 
 -- 各 format 对应的 MIME 类型前缀表
 local FORMAT_MIME_MAP = {
-    json = { "application/json" },
-    xml = { "application/xml", "text/xml" },
-    text = { "text/plain" },
-    html = { "text/html" }
+    json    = { "application/json" },
+    xml     = { "application/xml", "text/xml" },
+    text    = { "text/plain" },
+    html    = { "text/html" }
 }
 
 local function match_content_type(content_type, formats)
@@ -78,8 +89,17 @@ local function wrap_response(conf, status, body, is_json)
     local success = status >= 200 and status < 300
     local msg = conf.messages[tostring(status)] or (tostring(status) .. " ERROR")
 
+    local final_code = status
+    if conf.response_codes then
+        if success and conf.response_codes.success ~= nil then
+            final_code = conf.response_codes.success
+        elseif not success and conf.response_codes.failed ~= nil then
+            final_code = conf.response_codes.failed
+        end
+    end
+
     return {
-        code = status,
+        code = final_code,
         success = success,
         message = success and "" or msg,
         content = body
