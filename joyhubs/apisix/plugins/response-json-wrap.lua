@@ -1,9 +1,9 @@
 --
 -- 请求响应结果JSON包装插件（response-json-wrap）
 --
-local core      = require("apisix.core")
-local ngx       = ngx
-local cjson     = require("cjson.safe")
+local core = require("apisix.core")
+local ngx = ngx
+local cjson = require("cjson.safe")
 
 local plugin_name = "response-json-wrap"
 
@@ -36,10 +36,10 @@ local schema = {
 
 -- 各 format 对应的 MIME 类型前缀表
 local FORMAT_MIME_MAP = {
-    json    = { "application/json" },
-    xml     = { "application/xml", "text/xml" },
-    text    = { "text/plain" },
-    html    = { "text/html" }
+    json = { "application/json" },
+    xml = { "application/xml", "text/xml" },
+    text = { "text/plain" },
+    html = { "text/html" }
 }
 
 local function match_content_type(content_type, formats)
@@ -88,13 +88,18 @@ end
 
 local _M = {
     version = 0.1,
-    priority = 950,
+    priority = 1000, --确保在gzip插件（995）之前执行，数字越大越早执行
     name = plugin_name,
     schema = schema,
 }
 
 function _M.check_schema(conf)
     return core.schema.check(schema, conf)
+end
+
+-- 强制要求上游返回明文，避免GZIP结果返回，以便插件处理
+function _M.rewrite(conf, ctx)
+    core.request.set_header(ctx, "Accept-Encoding", "")
 end
 
 -- 判断是否需要包裹
@@ -104,6 +109,7 @@ function _M.header_filter(conf, ctx)
     if matched then
         ctx.wrap_enabled = true
         ctx.wrap_format = fmt
+        -- 清除content-length，因为包装后的长度会变
         ngx.header["content-length"] = nil
         -- 设置响应头
         ngx.header["content-type"] = "application/json; charset=utf-8"
@@ -118,18 +124,13 @@ function _M.body_filter(conf, ctx)
         return
     end
 
-    local chunk = ngx.arg[1]
-    local eof = ngx.arg[2]
-
-    ctx.resp_body = (ctx.resp_body or "") .. (chunk or "")
-
-    if not eof then
-        ngx.arg[1] = nil
+    local body = core.response.hold_body_chunk(ctx)
+    -- 数据还没传完，继续等待
+    if ngx.arg[2] == false and not body then
         return
     end
 
     local status = ngx.status
-    local body = ctx.resp_body or ""
     local is_json = ctx.wrap_format == "json"
     local content = body
 
