@@ -1,5 +1,6 @@
 --
 -- 数脉API-请求签名支持插件（表单提交方式）
+-- v1.0 (20260115)
 --
 local core = require("apisix.core")
 local md5 = require("resty.md5")
