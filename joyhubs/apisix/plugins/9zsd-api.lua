@@ -24,6 +24,7 @@ local ffi_str = ffi.string
 
 -- Localize the OpenResty method for performance and availability
 local req_set_body_data = ngx.req.set_body_data
+local ngx_encode_base64 = ngx.encode_base64
 
 local schema = {
     type = "object",
@@ -193,33 +194,39 @@ local function derive_key(app_key, factor_bytes)
 end
 
 -- 2. Encrypt Data (CBC Mode)
--- Logic: IV = encryptFactor (8 bytes) || encryptFactor (8 bytes)
-local function encrypt_sm4_cbc(data, key, factor_bytes)
+-- Logic:
+--   1. Generate Random IV (16 bytes)
+--   2. Encrypt Padded Data with CBC
+--   3. Result = IV || CipherText
+local function encrypt_sm4_cbc(data, key)
     if #key ~= 16 then return nil end
 
     local padded_data = pkcs7_pad(data)
     local rk = sm4_set_key(key)
 
-    -- Construct IV from Factor (8B + 8B)
-    local iv = factor_bytes .. factor_bytes
+    -- 1. Generate Random 16-byte IV
+    local iv = rand.bytes(16)
+    local current_iv = iv -- Used for chaining in loop
 
     local output_blocks = {}
 
+    -- 2. Encrypt
     for i = 1, #padded_data, 16 do
         local block = string.sub(padded_data, i, i+15)
         local xored = {}
         for j = 1, 16 do
             local b_in = string.byte(block, j)
-            local b_iv = string.byte(iv, j)
+            local b_iv = string.byte(current_iv, j)
             table.insert(xored, string.char(bxor(b_in, b_iv)))
         end
         local cipher_block = sm4_crypt_block(rk, table.concat(xored))
         table.insert(output_blocks, cipher_block)
-        iv = cipher_block
+        current_iv = cipher_block -- Update IV for next block (CBC)
     end
 
-    -- Use Standard Base64 (ngx.encode_base64)
-    return ngx.encode_base64(table.concat(output_blocks))
+    -- 3. Result = IV || CipherText
+    local binary_result = iv .. table.concat(output_blocks)
+    return ngx_encode_base64(binary_result)
 end
 
 local function sort_and_serialize(t)
@@ -270,13 +277,15 @@ function _M.rewrite(conf, ctx)
 
     if not Ke or not Ks then return 500 end
 
-    -- Encrypt (Pass encrypt_factor_bytes for IV generation)
+    -- Encrypt
     if body_json.bparams then
         local bparams_str = body_json.bparams
         if type(bparams_str) == "table" then bparams_str = json.encode(bparams_str) end
-        -- Pass factor for IV
-        local enc_bparams = encrypt_sm4_cbc(bparams_str, Ke, encrypt_factor_bytes)
-        if not enc_bparams then return 500 end
+        local enc_bparams = encrypt_sm4_cbc(bparams_str, Ke)
+        if not enc_bparams then
+            core.log.error("Failed to encrypt bparams")
+            return 500
+        end
         body_json.bparams = enc_bparams
     end
 
@@ -297,10 +306,12 @@ function _M.rewrite(conf, ctx)
     local hmac_sha256 = hmac.new(Ks, "sha256")
     hmac_sha256:update(string_to_sign)
     -- Use Base64 for Signature (matches Java SignUtil)
-    local sign_result = ngx.encode_base64(hmac_sha256:final())
+    local sign_result = ngx_encode_base64(hmac_sha256:final())
     body_json.sign = sign_result
 
-    req_set_body_data(core.json.encode(body_json))
+    local new_body_json_string = core.json.encode(body_json)
+    req_set_body_data(new_body_json_string)
+    core.log.info("new body json:", new_body_json_string)
 
     -- 设置标志位，表示已成功执行，避免多次执行
     ctx._9zsd_executed = true
