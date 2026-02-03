@@ -1,19 +1,21 @@
 --
--- Licensed to the Apache Software Foundation (ASF) under one or more
--- contributor license agreements.  See the NOTICE file distributed with
--- this work for additional information regarding copyright ownership.
--- The ASF licenses this file to You under the Apache License, Version 2.0
--- (the "License"); you may not use this file except in compliance with
--- the License.  You may obtain a copy of the License at
+-- ** 文件日志增强插件 **
+-- 功能说明：
+-- V0.2 - 2025/11/14
+-- 1. 增加响应体多层嵌套场景子对象属性值匹配支持（注意：不支持非完整JSON数据格式降级为正则匹配模式）
 --
---     http://www.apache.org/licenses/LICENSE-2.0
+-- V0.1
+-- 1. 解析请求原始响应结果（只支持JSON格式响应），判断结果中是否包含指定的属性值，如果包含则添加新的指定属性到访问日志中。
+-- 2. 属性匹配有增强实现处理
+--  2.1 APISIX对响应体提取有限制，默认最大为512KiB（MAX_REQ_BODY=524288），属性值匹配时会考虑截断情况并去除无效的UTF8字节，保证获取到可以正常编码的字符串
+--  2.2 获取到截断后的响应体字符串之后，属性值匹配降级为正则匹配模式；
+-- 3. 支持配置用于匹配的属性名（code_name参数）以及属性值列表（code_values），只要包含属性值列表中任意一个值则符合要求;
+-- 4. 支持配置新属性名（tag_name参数）以及属性值（match_tag参数和not_match_tag参数），如果匹配则添加该属性值，否则添加另一个属性值;
+-- 5. 支持配置日志输出文件路径（path参数）以及日志格式（log_format参数）；
+-- 6. 支持配置是否输出请求响应体（include_resp_body参数）；
+-- 7. 支持配置是否包含请求体（include_req_body参数），只有在配置了记录响应体时本插件的增强功能才会生效；
 --
--- Unless required by applicable law or agreed to in writing, software
--- distributed under the License is distributed on an "AS IS" BASIS,
--- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
--- See the License for the specific language governing permissions and
--- limitations under the License.
---
+
 local log_util     =   require("apisix.utils.log-util")
 local core         =   require("apisix.core")
 local expr         =   require("resty.expr.v1")
@@ -50,7 +52,8 @@ local schema = {
         },
         tag_name = { type = "string", default = "code_tag" },
         match_tag = { type = "integer", default = 1 },
-        not_match_tag = { type = "integer", default = 0 }
+        not_match_tag = { type = "integer", default = 0 },
+        none_match = { type = "integer", default = 9 }
     },
     required = {"path"}
 }
@@ -67,7 +70,7 @@ local metadata_schema = {
 
 
 local _M = {
-    version = 0.1,
+    version = 0.2,
     priority = 99,
     name = plugin_name,
     schema = schema,
@@ -246,6 +249,31 @@ local function safe_truncate_utf8(str)
     return ""
 end
 
+-- Function to resolve JSON paths using dot notation (e.g. "data.bizCode")
+local function get_nested_value(json_obj, path)
+    if not path or path == "" then
+        return json_obj
+    end
+
+    -- Split path by dots
+    local keys = {}
+    for key in string.gmatch(path, "[^%.]+") do
+        table.insert(keys, key)
+    end
+
+    local current = json_obj
+    for _, key in ipairs(keys) do
+        if current and type(current) == "table" then
+            current = current[key]
+        else
+            -- Path doesn't exist, return not_match_tag as per spec
+            return nil
+        end
+    end
+
+    return current
+end
+
 function _M.log(conf, ctx)
     local entry = log_util.get_log_entry(plugin_name, conf, ctx)
     if entry == nil then
@@ -256,14 +284,21 @@ function _M.log(conf, ctx)
     if ngx.status == 200 then
         -- check if response body is json format
         local code_resp_json = 0
-        local json_body = core.json.decode(ctx.resp_body or "")
-        -- check if response body contains code field
-        if json_body and json_body[conf.code_name] then
+        local success, json_parse = pcall(core.json.decode, ctx.resp_body or "")
+        if success and json_parse then
             code_resp_json = 1
-            -- check if code value is in the code_values list
-            if conf.code_hash[json_body[conf.code_name]] then
-                -- if matched, set the tag to match
-                tag = conf.match_tag
+            -- Use the get_nested_value function to handle both simple and nested paths
+            local extracted_value = get_nested_value(json_parse, conf.code_name)
+
+            if extracted_value ~= nil then
+                -- check if extracted value is in the code_values list
+                if conf.code_hash[extracted_value] then
+                    -- if matched, set the tag to match
+                    tag = conf.match_tag
+                end
+            else
+                -- If the path doesn't exist in valid JSON, set code_name parameter value to not_match_tag (as per spec)
+                tag = conf.not_match_tag
             end
         else
             -- if response body is too huge, fast truncate string in utf8 encoding
@@ -272,6 +307,7 @@ function _M.log(conf, ctx)
             end
             -- other data format, use regex to match, PCRE regex example: [[(,|{)\s*\\?"code\\?"\s*:\s*(-?\d+)\s*(,|})]]
             -- example response body: `,\"code\":0,`
+            -- Note: For malformed JSON, this regex will not work properly as it expects a JSON format
             local pattern = [[(,|{)\s*\\?"]] .. conf.code_name .. [[\\?"\s*:\s*(-?\d+)\s*(,|})]]
             local m, err = ngx.re.match((ctx.resp_body or ""), pattern, "jo")
             if m then
@@ -281,6 +317,9 @@ function _M.log(conf, ctx)
                 if is_match then
                     tag = conf.match_tag
                 end
+            else
+                -- if response body is malformed JSON or not valid JSON, and cant find the schema by regex, set the tag to none_match
+                tag = conf.none_match
             end
         end
         -- set the code_resp_json to log entry
