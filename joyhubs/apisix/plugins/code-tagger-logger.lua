@@ -1,6 +1,10 @@
 --
 -- ** 文件日志增强插件 **
 -- 功能说明：
+-- V0.3 - 2026/02/03
+-- 1. 增强 code_values 配置，支持字符串类型匹配，兼容原有数字匹配
+-- 2. 增加 code_value 字段记录功能，将实际提取到的比对属性值记录到日志中，便于对账
+--
 -- V0.2 - 2025/11/14
 -- 1. 增加响应体多层嵌套场景子对象属性值匹配支持（注意：不支持非完整JSON数据格式降级为正则匹配模式）
 --
@@ -46,11 +50,17 @@ local schema = {
         },
         code_values = {
             type = "array",
-            items = { type = "integer" },
+            items = {
+                anyOf = {
+                    {type = "integer"},
+                    {type = "string"}
+                }
+            },
             maxItems = 20,
             default = { 0, -3, -5, -7, -10 }
         },
         tag_name = { type = "string", default = "code_tag" },
+        value_name = { type = "string", default = "code_value" },
         match_tag = { type = "integer", default = 1 },
         not_match_tag = { type = "integer", default = 0 },
         none_match = { type = "integer", default = 9 }
@@ -70,7 +80,7 @@ local metadata_schema = {
 
 
 local _M = {
-    version = 0.2,
+    version = 0.3,
     priority = 99,
     name = plugin_name,
     schema = schema,
@@ -281,6 +291,10 @@ function _M.log(conf, ctx)
     end
     -- the default tag is not match
     local tag = conf.not_match_tag
+
+    -- 增加变量用于存储找到的原始值
+    local found_val = nil
+
     if ngx.status == 200 then
         -- check if response body is json format
         local code_resp_json = 0
@@ -291,6 +305,7 @@ function _M.log(conf, ctx)
             local extracted_value = get_nested_value(json_parse, conf.code_name)
 
             if extracted_value ~= nil then
+                found_val = extracted_value
                 -- check if extracted value is in the code_values list
                 if conf.code_hash[extracted_value] then
                     -- if matched, set the tag to match
@@ -305,13 +320,25 @@ function _M.log(conf, ctx)
             if ctx.resp_body and entry.response.body then
                 entry.response.body = safe_truncate_utf8(entry.response.body);
             end
-            -- other data format, use regex to match, PCRE regex example: [[(,|{)\s*\\?"code\\?"\s*:\s*(-?\d+)\s*(,|})]]
-            -- example response body: `,\"code\":0,`
+            -- other data format, use regex to match
+            -- Example (conf.code_name="code"):
+            -- PCRE2 Regex: /(,|{)\s*\\?"code\\?"\s*:\s*(?:\\?"(.*?)\\?"|(-?\d+))\s*(,|})/
+            --       ResponseBody: [,\"code\":0,] OR [,\"code\":"0",] OR [,\"code\":\"0\",]
             -- Note: For malformed JSON, this regex will not work properly as it expects a JSON format
-            local pattern = [[(,|{)\s*\\?"]] .. conf.code_name .. [[\\?"\s*:\s*(-?\d+)\s*(,|})]]
+            -- [V0.3] 升级正则逻辑，支持匹配数字或双引号包裹的字符串
+            -- pattern logic:
+            -- 1. match key: handles both "key" and \"key\" (escaped)
+            -- 2. match value: handles both "string" and \"string\" (escaped) AND integers
+            -- Regex breakdown:
+            -- \\? matches optional backslash (for escaped quotes)
+            -- (?:"([^"]*)"|(-?\d+)) updated to allow optional escaped quotes around string values
+            local pattern = [[(,|{)\s*\\?"]] .. conf.code_name .. [[\\?"\s*:\s*(?:\\?"(.*?)\\?"|(-?\d+))\s*(,|})]]
             local m, err = ngx.re.match((ctx.resp_body or ""), pattern, "jo")
             if m then
-                local code_value = m[2] or ""
+                -- m[2] is the string content (without quotes), m[3] is the integer
+                local code_value = m[2] or m[3] or ""
+                found_val = code_value
+
                 local is_match = conf.code_hash[code_value] or false
                 core.log.info("resp code value: " .. code_value .. ", resp code match: " .. tostring(is_match))
                 if is_match then
@@ -327,6 +354,11 @@ function _M.log(conf, ctx)
     end
     -- set the tag to log entry
     entry[conf.tag_name] = tag
+
+    -- 将找到的编码实际值写入日志（如果存在）
+    if found_val ~= nil then
+        entry[conf.value_name] = found_val
+    end
 
     write_file_data(conf, entry)
 end
