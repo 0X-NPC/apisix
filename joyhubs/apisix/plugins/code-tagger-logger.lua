@@ -1,6 +1,9 @@
 --
 -- ** 文件日志增强插件 **
 -- 功能说明：
+-- V0.4 - 2026/03/03
+-- 1. 新增 enable_code_match 配置项（默认true）。若配置为false，则不再解析响应体，直接将标记值设为not_match_tag的值，并在日志中增加 match_enabled 字段以标识状态。
+--
 -- V0.3 - 2026/02/03
 -- 1. 增强 code_values 配置，支持字符串类型匹配，兼容原有数字匹配
 -- 2. 增加 code_value 字段记录功能，将实际提取到的比对属性值记录到日志中，便于对账
@@ -59,11 +62,12 @@ local schema = {
             maxItems = 20,
             default = { 0, -3, -5, -7, -10 }
         },
-        tag_name = { type = "string", default = "code_tag" },
-        value_name = { type = "string", default = "code_value" },
-        match_tag = { type = "integer", default = 1 },
-        not_match_tag = { type = "integer", default = 0 },
-        none_match = { type = "integer", default = 9 }
+        tag_name = { type = "string", default = "code_tag", description = "计费标识属性名称" },
+        value_name = { type = "string", default = "code_value", description = "原始编码值属性名称" },
+        match_tag = { type = "integer", default = 1, description = "计费标识值" },
+        not_match_tag = { type = "integer", default = 0, description = "不计费标识值" },
+        none_match = { type = "integer", default = 9, description = "未成功匹配标识值" },
+        enable_code_match = { type = "boolean", default = true, description = "是否开启响应体编码值匹配" }
     },
     required = {"path"}
 }
@@ -80,7 +84,7 @@ local metadata_schema = {
 
 
 local _M = {
-    version = 0.3,
+    version = 0.4,
     priority = 99,
     name = plugin_name,
     schema = schema,
@@ -295,65 +299,72 @@ function _M.log(conf, ctx)
     -- 增加变量用于存储找到的原始值
     local found_val = nil
 
-    if ngx.status == 200 then
-        -- check if response body is json format
-        local code_resp_json = 0
-        local success, json_parse = pcall(core.json.decode, ctx.resp_body or "")
-        if success and json_parse then
-            code_resp_json = 1
-            -- Use the get_nested_value function to handle both simple and nested paths
-            local extracted_value = get_nested_value(json_parse, conf.code_name)
+    -- 只在开启编码匹配「enable_code_match」时，才解析响应体做编码匹配；
+    -- 否则直接使用默认的 not_match_tag 值标记该调用为非计费日志
+    if conf.enable_code_match then
+        if ngx.status == 200 then
+            -- check if response body is json format
+            local code_resp_json = 0
+            local success, json_parse = pcall(core.json.decode, ctx.resp_body or "")
+            if success and json_parse then
+                code_resp_json = 1
+                -- Use the get_nested_value function to handle both simple and nested paths
+                local extracted_value = get_nested_value(json_parse, conf.code_name)
 
-            if extracted_value ~= nil then
-                found_val = extracted_value
-                -- check if extracted value is in the code_values list
-                if conf.code_hash[extracted_value] then
-                    -- if matched, set the tag to match
-                    tag = conf.match_tag
+                if extracted_value ~= nil then
+                    found_val = extracted_value
+                    -- check if extracted value is in the code_values list
+                    if conf.code_hash[extracted_value] then
+                        -- if matched, set the tag to match
+                        tag = conf.match_tag
+                    end
+                else
+                    -- If the path doesn't exist in valid JSON, set code_name parameter value to not_match_tag (as per spec)
+                    tag = conf.not_match_tag
                 end
             else
-                -- If the path doesn't exist in valid JSON, set code_name parameter value to not_match_tag (as per spec)
-                tag = conf.not_match_tag
-            end
-        else
-            -- if response body is too huge, fast truncate string in utf8 encoding
-            if ctx.resp_body and entry.response.body then
-                entry.response.body = safe_truncate_utf8(entry.response.body);
-            end
-            -- other data format, use regex to match
-            -- Example (conf.code_name="code"):
-            -- PCRE2 Regex: /(,|{)\s*\\?"code\\?"\s*:\s*(?:\\?"(.*?)\\?"|(-?\d+))\s*(,|})/
-            --       ResponseBody: [,\"code\":0,] OR [,\"code\":"0",] OR [,\"code\":\"0\",]
-            -- Note: For malformed JSON, this regex will not work properly as it expects a JSON format
-            -- [V0.3] 升级正则逻辑，支持匹配数字或双引号包裹的字符串
-            -- pattern logic:
-            -- 1. match key: handles both "key" and \"key\" (escaped)
-            -- 2. match value: handles both "string" and \"string\" (escaped) AND integers
-            -- Regex breakdown:
-            -- \\? matches optional backslash (for escaped quotes)
-            -- (?:"([^"]*)"|(-?\d+)) updated to allow optional escaped quotes around string values
-            local pattern = [[(,|{)\s*\\?"]] .. conf.code_name .. [[\\?"\s*:\s*(?:\\?"(.*?)\\?"|(-?\d+))\s*(,|})]]
-            local m, err = ngx.re.match((ctx.resp_body or ""), pattern, "jo")
-            if m then
-                -- m[2] is the string content (without quotes), m[3] is the integer
-                local code_value = m[2] or m[3] or ""
-                found_val = code_value
-
-                local is_match = conf.code_hash[code_value] or false
-                core.log.info("resp code value: " .. code_value .. ", resp code match: " .. tostring(is_match))
-                if is_match then
-                    tag = conf.match_tag
+                -- if response body is too huge, fast truncate string in utf8 encoding
+                if ctx.resp_body and entry.response.body then
+                    entry.response.body = safe_truncate_utf8(entry.response.body);
                 end
-            else
-                -- if response body is malformed JSON or not valid JSON, and cant find the schema by regex, set the tag to none_match
-                tag = conf.none_match
+                -- other data format, use regex to match
+                -- Example (conf.code_name="code"):
+                -- PCRE2 Regex: /(,|{)\s*\\?"code\\?"\s*:\s*(?:\\?"(.*?)\\?"|(-?\d+))\s*(,|})/
+                --       ResponseBody: [,\"code\":0,] OR [,\"code\":"0",] OR [,\"code\":\"0\",]
+                -- Note: For malformed JSON, this regex will not work properly as it expects a JSON format
+                -- [V0.3] 升级正则逻辑，支持匹配数字或双引号包裹的字符串
+                -- pattern logic:
+                -- 1. match key: handles both "key" and \"key\" (escaped)
+                -- 2. match value: handles both "string" and \"string\" (escaped) AND integers
+                -- Regex breakdown:
+                -- \\? matches optional backslash (for escaped quotes)
+                -- (?:"([^"]*)"|(-?\d+)) updated to allow optional escaped quotes around string values
+                local pattern = [[(,|{)\s*\\?"]] .. conf.code_name .. [[\\?"\s*:\s*(?:\\?"(.*?)\\?"|(-?\d+))\s*(,|})]]
+                local m, err = ngx.re.match((ctx.resp_body or ""), pattern, "jo")
+                if m then
+                    -- m[2] is the string content (without quotes), m[3] is the integer
+                    local code_value = m[2] or m[3] or ""
+                    found_val = code_value
+
+                    local is_match = conf.code_hash[code_value] or false
+                    core.log.info("resp code value: " .. code_value .. ", resp code match: " .. tostring(is_match))
+                    if is_match then
+                        tag = conf.match_tag
+                    end
+                else
+                    -- if response body is malformed JSON or not valid JSON, and cant find the schema by regex, set the tag to none_match
+                    tag = conf.none_match
+                end
             end
+            -- set the code_resp_json to log entry
+            entry.code_resp_json = code_resp_json
         end
-        -- set the code_resp_json to log entry
-        entry.code_resp_json = code_resp_json
     end
+
     -- set the tag to log entry
     entry[conf.tag_name] = tag
+    -- 将当前 match_enabled 状态显式写入日志，便于排查与对账（true为1，false为0）
+    entry.match_enabled = conf.enable_code_match and 1 or 0
 
     -- 将找到的编码实际值写入日志（如果存在）
     if found_val ~= nil then
